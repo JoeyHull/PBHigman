@@ -1,0 +1,1125 @@
+#IMPORTS FOR GRAPH DRAWING AND GENERATION
+import numpy as np
+from scipy.sparse import lil_matrix
+import random
+import matplotlib.pyplot as plt
+import networkx as nx
+from collections import Counter, defaultdict
+import time
+
+# for setting the environment variables and paths
+import os
+
+# for parallel computation of A and r
+from multiprocessing import Pool
+
+# for working with tensors and sending them around
+import torch
+
+# HF stuff for tokenization
+from tokenizers import Tokenizer
+from tokenizers.pre_tokenizers import Whitespace
+from tokenizers.models import WordLevel
+from transformers import PreTrainedTokenizerFast
+
+
+# HF stuff for storing the datasets X_i
+from datasets import Dataset
+from datasets import load_from_disk
+
+
+
+# HF stuff for training and generating
+from transformers import (
+    GPT2Config,
+    GPT2LMHeadModel,
+    Trainer,
+    TrainingArguments,
+    DataCollatorForLanguageModeling,
+    PreTrainedTokenizerFast,
+    pipeline
+)
+
+# Pretty progress bars and histogram plotting
+from tqdm.auto import tqdm
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+
+
+
+# Configuration
+GRID_WIDTH = 100
+GRID_HEIGHT = 100
+NUM_TILES = 4
+
+# Global variables
+coord_to_id = {}
+edges = []
+tiles = []
+tile_coords = []
+used_tiles = set()
+merge_map = {}
+next_node_id = 0  # global counter for new merged nodes
+
+
+start_x = (GRID_WIDTH - 1) // 2
+start_y = (GRID_HEIGHT - 1) // 2
+used_tiles.add((start_x, start_y))
+frontier = set([
+    (start_x + 1, start_y),
+    (start_x - 1, start_y),
+    (start_x, start_y + 1),
+    (start_x, start_y - 1)
+])
+
+
+def get_node_id(coord):
+    '''
+    Creates id's for each node(labels)
+    '''
+    if coord not in coord_to_id:
+        coord_to_id[coord] = len(coord_to_id)
+    return coord_to_id[coord]
+
+
+def add_tile(x, y):
+    '''
+    Adds a tile
+    '''
+    bl = (x, y)
+    br = (x + 1, y)
+    tl = (x, y + 1)
+    tr = (x + 1, y + 1)
+
+    bl_id = get_node_id(bl)
+    br_id = get_node_id(br)
+    tl_id = get_node_id(tl)
+    tr_id = get_node_id(tr)
+
+    tiles.append((bl_id, br_id, tr_id, tl_id))
+    tile_coords.append((x, y))
+
+    directed_edges = [
+        (bl_id, br_id),
+        (bl_id, tl_id),
+        (br_id, tr_id),
+        (tl_id, tr_id),
+    ]
+
+    for u, v in directed_edges:
+        coord_u = [coord for coord, uid in coord_to_id.items() if uid == u][0]
+        coord_v = [coord for coord, uid in coord_to_id.items() if uid == v][0]
+        weight = 1 if coord_u[0] != coord_v[0] else 2
+        edges.append((u, v, weight))
+
+
+def is_valid(x, y):
+    '''
+    Checks to see if a tile is within the grid dimensions and hasn't been added yet
+    '''
+    return 0 <= x < GRID_WIDTH - 1 and 0 <= y < GRID_HEIGHT - 1 and (x, y) not in used_tiles
+
+
+def find_structured_iso_vertices(return_nodes=False, local_tiles=None):
+    """
+    Finds vertices that participate in exactly 4 tiles with the following configuration:
+        (v,a,b,c), (e,v,c,d), (f,g,v,e), (g,h,a,v)
+    where each 4-tuple is a tile (bl, br, tr, tl)
+    and node v appears once in each tile.
+
+    If return_nodes is True, returns (count, list_of_nodes)
+    """
+    if local_tiles is None:
+        local_tiles = tiles
+
+    # Step 1: Map nodes to the tiles and positions they appear in
+    node_to_tile_pos = defaultdict(list)  # node → list of (tile_index, position)
+
+    for tile_index, tile in enumerate(local_tiles):
+        for pos, node in enumerate(tile):
+            node_to_tile_pos[node].append((tile_index, pos))
+
+    # Step 2: Find nodes with exactly 4 appearances (once in 4 different tiles)
+    valid_nodes = []
+    for node, occurrences in node_to_tile_pos.items():
+        if len(occurrences) != 4:
+            continue
+
+        tile_indices = [t[0] for t in occurrences]
+        if len(set(tile_indices)) != 4:
+            continue
+
+        # Extract the 4 tiles
+        candidate_tiles = [local_tiles[i] for i in tile_indices]
+
+        # Try all permutations of the 4 tiles to find the right configuration
+        from itertools import permutations
+
+        for perm in permutations(candidate_tiles):
+            t1, t2, t3, t4 = perm
+
+            # Find where `node` is in each tile
+            try:
+                v1 = t1.index(node)
+                v2 = t2.index(node)
+                v3 = t3.index(node)
+                v4 = t4.index(node)
+            except ValueError:
+                continue
+
+            # Extract values based on pattern (v,a,b,c) etc.
+            # Pattern:
+            #  t1: (v, a, b, c)
+            #  t2: (e, v, c, d)
+            #  t3: (f, g, v, e)
+            #  t4: (g, h, a, v)
+
+            try:
+                # Map tiles to variables based on assumption that `v` is at pos 0 in t1
+                v, a, b, c = rotate_tile_to_match_v_first(t1, node)
+                e2, v, c2, d = rotate_tile_to_match_v_second(t2, node)
+                f, g, v, e3 = rotate_tile_to_match_v_third(t3, node)
+                g2, h, a2, v = rotate_tile_to_match_v_fourth(t4, node)
+            except Exception:
+                continue
+
+            # Now check structural constraints:
+            if a == a2 and c == c2 and e2 == e3 and g == g2:
+                valid_nodes.append(node)
+                break  # stop checking permutations
+
+    if return_nodes:
+        return len(valid_nodes), valid_nodes
+    else:
+        return len(valid_nodes)
+
+def rotate_tile_to_match_v_first(tile, v):
+    for i in range(4):
+        rotated = tile[i:] + tile[:i]
+        if rotated[0] == v:
+            return rotated
+    raise ValueError("v not found in tile")
+
+def rotate_tile_to_match_v_second(tile, v):
+    for i in range(4):
+        rotated = tile[i:] + tile[:i]
+        if rotated[1] == v:
+            return rotated
+    raise ValueError("v not in position 1")
+
+def rotate_tile_to_match_v_third(tile, v):
+    for i in range(4):
+        rotated = tile[i:] + tile[:i]
+        if rotated[2] == v:
+            return rotated
+    raise ValueError("v not in position 2")
+
+def rotate_tile_to_match_v_fourth(tile, v):
+    for i in range(4):
+        rotated = tile[i:] + tile[:i]
+        if rotated[3] == v:
+            return rotated
+    raise ValueError("v not in position 3")
+
+
+def r(N,tile_list=None):
+    '''
+    Reward function (0 if no iso vertices, 1 if all iso (torus))
+    '''
+    count, nodes = find_structured_iso_vertices(return_nodes=True,local_tiles=tile_list)
+    return count / N
+
+
+def find_boundary_edges(N, adj_csr, tile_list):
+    '''
+    Finds the edges in the boundary (connected to at most one tile)
+    '''
+    edge_counter = Counter()
+    for tile in tile_list:
+        bl, br, tr, tl = tile
+        directed_edges = [
+            (bl, br),
+            (bl, tl),
+            (br, tr),
+            (tl, tr),
+        ]
+        for edge in directed_edges:
+            edge_counter[edge] += 1
+
+    boundary_edges = []
+    for (u, v), count in edge_counter.items():
+        if count == 1:
+            weight = adj_csr[u, v]
+            weight = weight if np.isscalar(weight) else weight.toarray()[0, 0]
+            boundary_edges.append((u, v, float(weight)))
+    return boundary_edges
+
+
+def pair(boundary, do_vert=False, do_horizon=False, max_retries=100):
+    '''
+    Pairs boundary edges (horizontal or vertical).
+    Retries random orderings until no same-tile-only leftovers remain.
+    '''
+    vert = [e for e in boundary if e[2] == 2]
+    horizon = [e for e in boundary if e[2] == 1]
+    edge_list = vert if do_vert else horizon
+
+    # Build edge-to-tile map
+    edge_to_tiles = defaultdict(set)
+    for idx, tile in enumerate(tiles):
+        bl, br, tr, tl = tile
+        tile_edges = [
+            (bl, br),
+            (bl, tl),
+            (br, tr),
+            (tl, tr),
+        ]
+        for edge in tile_edges:
+            edge_to_tiles[tuple(sorted(edge))].add(idx)
+
+    def in_same_tile(e1, e2):
+        t1 = edge_to_tiles.get(tuple(sorted((e1[0], e1[1]))), set())
+        t2 = edge_to_tiles.get(tuple(sorted((e2[0], e2[1]))), set())
+        return bool(t1 & t2)
+
+    def try_pair(edges):
+        pairs = []
+        used = set()
+        for i in range(len(edges)):
+            if i in used:
+                continue
+            u1, v1, _ = edges[i]
+            for j in range(i + 1, len(edges)):
+                if j in used:
+                    continue
+                u2, v2, _ = edges[j]
+                if len({u1, v1} & {u2, v2}) == 0 and not in_same_tile((u1, v1), (u2, v2)):
+                    pairs.append((edges[i], edges[j]))
+                    used.update([i, j])
+                    break
+        leftover = [edges[i] for i in range(len(edges)) if i not in used]
+        return pairs, leftover
+
+    # Try multiple random orderings to get a clean pairing
+    for attempt in range(max_retries):
+        random.shuffle(edge_list)
+        pairs, leftover = try_pair(edge_list)
+        if len(leftover) < 2:
+            return pairs
+    print("[WARNING] Max retries reached. Returning best-effort pairs.")
+    return pairs  # May leave one pair unpaired in worst case
+
+
+def glue(edge_pairs):
+    '''
+    Main gluing function
+    - Maps existing paired nodes to a new id
+    - Updates list of edges with new mapped nodes
+    - Updates list of tiles with new mapped nodes
+    - Resolves new mappings for more than one gluing call
+    '''
+    global merge_map, next_node_id
+
+    if not merge_map:
+        existing_nodes = set()
+        for u, v, _ in edges:
+            existing_nodes.update([u, v])
+        next_node_id = max(existing_nodes) + 1
+
+    for (u1, v1, _), (u2, v2, _) in edge_pairs:
+        ru1 = resolve_mapping(u1)
+        ru2 = resolve_mapping(u2)
+        if ru1 in merge_map:
+            merged_u = merge_map[ru1]
+        elif ru2 in merge_map:
+            merged_u = merge_map[ru2]
+        else:
+            merged_u = next_node_id
+            next_node_id += 1
+
+        rv1 = resolve_mapping(v1)
+        rv2 = resolve_mapping(v2)
+        if rv1 in merge_map:
+            merged_v = merge_map[rv1]
+        elif rv2 in merge_map:
+            merged_v = merge_map[rv2]
+        else:
+            merged_v = next_node_id
+            next_node_id += 1
+
+        for u in [u1, u2]:
+            merge_map[u] = merged_u
+        for v in [v1, v2]:
+            merge_map[v] = merged_v
+
+    # ✅ Normalize the entire merge_map
+    for node in list(merge_map.keys()):
+        resolve_mapping(node)
+
+    # Rebuild edge list using final merged IDs
+    new_edges = []
+    for u, v, w in edges:
+        new_u = resolve_mapping(u)
+        new_v = resolve_mapping(v)
+        if new_u != new_v:
+            new_edges.append((new_u, new_v, w))
+    new_edges = list(set(new_edges))
+
+    # Rebuild tile list
+    new_tiles = []
+    for tile in tiles:
+        new_tile = tuple(resolve_mapping(n) for n in tile)
+        new_tiles.append(new_tile)
+
+    return new_edges, new_tiles
+
+def create_graph():
+    '''
+    Creates the graph
+    '''
+    while len(used_tiles) < NUM_TILES and frontier:
+        fx, fy = random.choice(list(frontier))
+        frontier.remove((fx, fy))
+        if not is_valid(fx, fy):
+            continue
+        used_tiles.add((fx, fy))
+        add_tile(fx, fy)
+        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nx_, ny = fx + dx, fy + dy
+            if is_valid(nx_, ny):
+                frontier.add((nx_, ny))
+
+
+def count_unique_nodes(edge_list=None, tile_list=None):
+    '''
+    Counts nodes (not sure if I need this but it works and I'll fix later)
+    '''
+    unique_nodes = set()
+    if edge_list:
+        for u, v, _ in edge_list:
+            unique_nodes.update([u, v])
+    if tile_list:
+        for tile in tile_list:
+            unique_nodes.update(tile)
+    return len(unique_nodes)
+
+def count_final_nodes(edge_list):
+    """
+    Counts unique, resolved node IDs after gluing.
+    Ensures transitive merges are accounted for.
+    """
+    resolved_nodes = set()
+    for u, v, _ in edge_list:
+        resolved_nodes.add(resolve_mapping(u))
+        resolved_nodes.add(resolve_mapping(v))
+    return len(resolved_nodes)
+
+def get_grid_positions():
+    '''
+    Fixes grid (makes it rectangular before gluing)
+    '''
+    return {node_id: coord for coord, node_id in coord_to_id.items()}
+
+
+def draw_graph(edge_list, ax, title, boundary_edges=set(), pos=None):
+    '''
+    Draws graph
+    '''
+    G = nx.DiGraph()
+    for u, v, w in edge_list:
+        G.add_edge(u, v, weight=w)
+    edge_colors = ["green" if (u, v) in boundary_edges else ("blue" if G[u][v]['weight'] == 1 else "red") for u, v in G.edges()]
+    nx.draw(G, pos, ax=ax, with_labels=True, edge_color=edge_colors,
+            arrows=True, node_size=500, font_size=10, width=2, arrowsize=20)
+    ax.set_title(title)
+
+def resolve_mapping(node):
+    """
+    Resolves the final node ID after following the merge chain recursively.
+    Applies path compression to flatten the mapping.
+    """
+    path = []
+    while node in merge_map and merge_map[node] != node:
+        path.append(node)
+        node = merge_map[node]
+    final = node
+    for n in path:
+        merge_map[n] = final
+    return final
+
+
+def generate_graph(num_graphs=1, min_tiles=10, max_tiles=50):
+    """
+    Generates graphs and merges their horizontal and vertical edges.
+    Returns a list of graph dicts with merged edges and tiles.
+    """
+    graphs = []
+    start_time = time.time()
+    for _ in range(num_graphs):
+        # Reset globals
+        global coord_to_id, edges, tiles, tile_coords, used_tiles, merge_map, next_node_id, frontier
+
+        coord_to_id = {}
+        edges = []
+        tiles = []
+        tile_coords = []
+        used_tiles = set()
+        merge_map = {}
+        next_node_id = 0
+
+        start_x = (GRID_WIDTH - 1) // 2
+        start_y = (GRID_HEIGHT - 1) // 2
+        used_tiles.add((start_x, start_y))
+        frontier = set([
+            (start_x + 1, start_y),
+            (start_x - 1, start_y),
+            (start_x, start_y + 1),
+            (start_x, start_y - 1)
+        ])
+
+        #Generate random amount of tiles
+        num_tiles = random.randint(min_tiles, max_tiles)
+        max_attempts = 10 * num_tiles  # Arbitrary cap to prevent infinite loop
+        attempts = 0
+
+        while len(used_tiles) < num_tiles and frontier and attempts < max_attempts:
+            fx, fy = random.choice(list(frontier))
+            frontier.remove((fx, fy))
+            if not is_valid(fx, fy):
+                attempts += 1
+                continue
+            used_tiles.add((fx, fy))
+            add_tile(fx, fy)
+            for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nx_, ny = fx + dx, fy + dy
+                if is_valid(nx_, ny):
+                    frontier.add((nx_, ny))
+            attempts += 1
+
+        if (start_x, start_y) not in used_tiles:
+            add_tile(start_x, start_y)
+            
+        # Initial reward (before merging)
+        num_nodes = count_unique_nodes(edge_list=edges)
+        reward_before = r(num_nodes)
+        
+        # Initial counts and adjacency
+        num_nodes = count_unique_nodes(edge_list=edges)
+        adj = lil_matrix((num_nodes, num_nodes), dtype=np.float32)
+        for u, v, w in edges:
+            adj[u, v] = w
+        adj_csr = adj.tocsr()
+
+        # --- Horizontal merge ---
+        boundary = find_boundary_edges(num_nodes, adj_csr, tiles)
+        pairs = pair(boundary, do_horizon=True)
+        merged_edges, merged_tiles = glue(pairs)
+        tiles[:] = merged_tiles  # Update global tiles
+
+        # Reward after horizontal merge
+        num_nodes_horiz = count_unique_nodes(edge_list=merged_edges)
+        reward_after_horiz = r(num_nodes_horiz)
+
+        # Rebuild adjacency after horizontal merge
+        max_node_id = max(max(u, v) for u, v, _ in merged_edges)
+        new_adj = lil_matrix((max_node_id + 1, max_node_id + 1), dtype=np.float32)
+        for u, v, w in merged_edges:
+            new_adj[u, v] = w
+        new_adj_csr = new_adj.tocsr()
+
+        # --- Vertical merge ---
+        new_boundary = find_boundary_edges(count_unique_nodes(edge_list=merged_edges), new_adj_csr, tiles)
+        new_pairs = pair(new_boundary, do_vert=True)
+        merged_edges, merged_tiles = glue(new_pairs)
+        tiles[:] = merged_tiles
+
+        # Reward after vertical merge
+        num_nodes_vert = count_unique_nodes(edge_list=merged_edges)
+        reward_after_vert = r(num_nodes_vert)
+        
+        # Store merged graph data
+        graph_data = {
+            'tiles': tiles.copy(),
+            'edges': merged_edges.copy(),
+            'used_tiles': used_tiles.copy(),
+            'coord_to_id': coord_to_id.copy(),
+            'merge_map': merge_map.copy(),
+            'reward_before': reward_before,
+            'reward_after_horizontal': reward_after_horiz,
+            'reward_after_vertical': reward_after_vert,
+        }
+        graphs.append(graph_data)
+        elapsed = time.time() - start_time
+        start_time = time.time()
+
+    return graphs
+
+def generate_single_sample(_):
+    graphs = generate_graph(num_graphs=1, min_tiles=10, max_tiles=50)
+    graph = graphs[0]
+
+    # Convert tiles to strings
+    tile_strings = ["_".join(map(str, tile)) for tile in graph['tiles']]
+    text_for_tokenizer = " ".join(tile_strings)
+
+    # Choose a reward value to store (maybe reward_after_vertical)
+    reward = graph['reward_after_vertical']
+
+    return {"text": text_for_tokenizer, "reward": reward}
+
+
+def generate_initial_dataset(num_samples):
+    dataset_path = os.path.join(data_path, f"X_0")
+    if os.path.exists(dataset_path):
+        print(f"Loading dataset from {dataset_path}...")
+        dataset = Dataset.load_from_disk(dataset_path)
+    else:
+        print(f"Generating initial dataset with {num_samples} samples...")
+        with Pool() as pool:
+            samples = list(tqdm(pool.imap_unordered(generate_single_sample, range(num_samples)), total=num_samples))
+        dataset = Dataset.from_list(samples)
+        dataset.save_to_disk(dataset_path)
+    return dataset
+
+# def initialize_tokenizer(X_0_top, vocab_size=100):
+#     """
+#     Initialize and train a BPE tokenizer on tile strings, or load it if already saved.
+
+#     Args:
+#         data_path (str): path to save/load tokenizer.
+#         X_0_top (Dataset): HF dataset with a "text" column containing tile strings.
+#         vocab_size (int): vocabulary size for tokenizer training.
+
+#     Returns:
+#         PreTrainedTokenizerFast: trained tokenizer.
+#     """
+#     tokenizer_path = os.path.join(data_path, f"tokenizer_N{vocab_size}")
+
+#     if os.path.exists(tokenizer_path):
+#         print(f"Loading tokenizer from {tokenizer_path}...")
+#         tokenizer = PreTrainedTokenizerFast.from_pretrained(tokenizer_path)
+#     else:
+#         print("Training new tokenizer on tile strings...")
+
+#         # Initialize raw tokenizer with BPE model
+#         raw_tokenizer = Tokenizer(BPE())
+#         raw_tokenizer.pre_tokenizer = Whitespace()
+
+#         # Trainer for BPE with specified vocab size
+#         trainer = BpeTrainer(vocab_size=vocab_size, special_tokens=["<s>", "</s>", "<pad>"])
+
+#         # Train from iterator over tile strings in dataset
+#         raw_tokenizer.train_from_iterator(X_0_top["text"], trainer=trainer)
+
+#         # Wrap in HF PreTrainedTokenizerFast for easy integration with transformers
+#         tokenizer = PreTrainedTokenizerFast(
+#             tokenizer_object=raw_tokenizer,
+#             bos_token="<s>",
+#             eos_token="</s>",
+#             pad_token="<pad>",
+#         )
+
+#         # Save tokenizer for later reuse
+#         tokenizer.save_pretrained(tokenizer_path)
+
+#     return tokenizer
+
+def tokenize_function(examples):
+    return tokenizer(
+        examples["text"],
+        padding="max_length",    # pad all to max_length
+        truncation=True,
+        max_length=150          # increase max length based on your data
+    )
+
+def decode_tile_string(tile_string):
+    """
+    Converts a space-separated string of tiles like "12_13_14_15 16_17_18_19"
+    back into a list of 4-tuples of integers.
+    """
+    tile_tuples = []
+    tile_chunks = tile_string.strip().split()
+    for chunk in tile_chunks:
+        try:
+            nums = list(map(int, chunk.split('_')))
+            if len(nums) == 4:
+                tile_tuples.append(tuple(nums))
+            else:
+                raise ValueError(f"Invalid tile format: {chunk}")
+        except Exception as e:
+            print(f"Error parsing tile string '{chunk}': {e}")
+    return tile_tuples
+
+def is_valid_tile_sequence(text, min_tiles=5, max_tiles=100):
+        """
+        Validates that a generated string represents a valid sequence of tiles.
+        """
+        tile_chunks = text.strip().split()
+        if not (min_tiles <= len(tile_chunks) <= max_tiles):
+            return False
+
+        for chunk in tile_chunks:
+            parts = chunk.split('_')
+            if len(parts) != 4:
+                return False
+            if not all(part.isdigit() for part in parts):
+                return False
+
+        return True
+
+def build_tile_tokenizer(X_0_top, vocab_size=10000, tokenizer_path="tile_tokenizer"):
+    # 1. Extract all unique tile strings (split by spaces)
+    tile_set = set()
+    for text in X_0_top["text"]:
+        tile_set.update(text.strip().split())
+
+    # 2. Define special tokens
+    special_tokens = ["<s>", "</s>", "<pad>"]
+
+    # 3. Create vocabulary
+    vocab = {token: idx for idx, token in enumerate(special_tokens + sorted(tile_set))}
+
+    # 4. Build WordLevel model
+    model = WordLevel(vocab=vocab, unk_token="<pad>")
+    tokenizer = Tokenizer(model)
+    tokenizer.pre_tokenizer = Whitespace()  # splits on spaces
+
+    # 5. Wrap into PreTrainedTokenizerFast
+    hf_tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer,
+        bos_token="<s>",
+        eos_token="</s>",
+        pad_token="<pad>"
+    )
+
+    # 6. Save tokenizer
+    os.makedirs(tokenizer_path, exist_ok=True)
+    hf_tokenizer.save_pretrained(tokenizer_path)
+
+    return hf_tokenizer
+
+def process_reward(args):
+        return r(*args)
+
+def tiles_to_edge_list(tile_list):
+    """
+    Given a list of 4-tuples (tiles), returns a deduplicated list of directed edges with weights.
+    - Horizontal edges (left→right) have weight 1.
+    - Vertical edges (bottom→top) have weight 2.
+
+    Args:
+        tile_list (list of tuple): List of 4-tuples representing tiles (bl, br, tr, tl).
+
+    Returns:
+        edge_list (list of tuple): List of edges (u, v, weight).
+    """
+    edge_set = set()
+    for tile in tile_list:
+        bl, br, tr, tl = tile
+
+        # Define edges
+        edges = [
+            (bl, br, 1),  # horizontal bottom
+            (bl, tl, 2),  # vertical left
+            (br, tr, 2),  # vertical right
+            (tl, tr, 1),  # horizontal top
+        ]
+
+        for edge in edges:
+            edge_set.add(edge)  # avoid duplicates
+
+    return list(edge_set)
+
+def generate_pos_from_edges(edges):
+    G = nx.DiGraph()
+    for u, v, w in edges:
+        G.add_edge(u, v, weight=w)
+    return nx.spring_layout(G, seed=42)
+
+#######################################DRIVER CODE################################################
+# Let's set up our enviroment variables, paths, devices and seeds
+
+os.environ['TOKENIZERS_PARALLELISM'] = 'false' # to avoid warnings while using multiprocessing
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "3" # choose your GPU index if you have a multi-gpu setup
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # normally Trainer choose the device by itself, but for generation we will need it to move the batches around.
+
+data_path = "PB_data/40k_X0_run_4" # path to store the data
+os.makedirs(data_path, exist_ok=True)
+
+SEED = 42 # for reproducibility
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
+
+if __name__ == "__main__":
+    #Generate Sample
+    X_0 = generate_initial_dataset(num_samples=40000)
+
+    # Now let's sort the dataset by rewards and take the top 25% of the samples to obtain X_0^{top}
+
+    X_0 = X_0.sort("reward", reverse=True)
+    X_0_top = X_0.select(range(len(X_0) // 4))
+    print(X_0_top['reward'])
+
+    # TOKENIZATION
+    tokenizer = build_tile_tokenizer(X_0_top, tokenizer_path=os.path.join(data_path, "tile_tokenizer"))
+
+    # # Remove columns that are not needed (you already removed "reward")
+    X_0_top_text = X_0_top.remove_columns(["reward"])
+
+    X_0_top_tokenized = X_0_top_text.map(
+        tokenize_function,
+        batched=True,
+        remove_columns=["text"]  # remove original text after tokenizing
+        )
+
+    # Here are the rewards distributions for X_0 and X_0_top (compare with Figure 1 in the paper)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+
+    # Plot histogram for X_0
+    ax1.hist(X_0['reward'], bins=45, edgecolor='black', linewidth=1)
+    ax1.set_title('Rewards Distribution in $X_0$')
+    ax1.set_xlabel('Reward')
+    ax1.set_ylabel('Count')
+
+    # Plot histogram for X_0_top
+    ax2.hist(X_0_top['reward'], bins=45, edgecolor='black', linewidth=1)
+    ax2.set_title('Rewards Distribution in $X_0^{\mathrm{top}}$')
+    ax2.set_xlabel('Reward')
+    ax2.set_ylabel('Count')
+
+    plt.tight_layout()
+    plt.show()
+
+
+    # #TRAINING
+    # split_datasets = X_0_top_tokenized.train_test_split(test_size=0.1)  
+    # config = GPT2Config(
+    # vocab_size=len(tokenizer),
+    # n_positions=150, # same as maximal sequence length in the tokenizer
+    # n_embd=16,
+    # n_layer=2,
+    # n_head=4,
+    # bos_token_id=tokenizer.bos_token_id,
+    # eos_token_id=tokenizer.eos_token_id,)
+
+    # os.path.join(data_path, "tile_tokenizer")
+    # # # # Initialize model
+    # model_path = os.path.join(data_path, f"tile_model_0")
+    # if os.path.exists(model_path):
+    #     print(f"Loading model from {model_path}...")
+    #     model = GPT2LMHeadModel.from_pretrained(model_path)
+    # else:
+    #     print("Initializing new model...")
+    #     model = GPT2LMHeadModel(config)
+    # model.to(device)
+
+    # # # Get the vocab dictionary: token → ID
+    # # vocab = tokenizer.get_vocab()
+
+    # # # Reverse mapping: ID → token
+    # # id_to_token = {id_: tok for tok, id_ in vocab.items()}
+
+    # # # Example: print the first 20 tokens
+    # # for i in range(100):
+    # #     print(f"{i}: {id_to_token.get(i)}")
+
+
+    # training_args = TrainingArguments(
+    #     output_dir=os.path.join(data_path, f"generation_0"), # necessary argument, but not used in fact
+    #     overwrite_output_dir=True,
+    #     max_steps=15_000,
+    #     per_device_train_batch_size=32,
+    #     per_device_eval_batch_size=32,
+    #     learning_rate=5e-4,
+    #     lr_scheduler_type="constant",
+    #     eval_strategy="steps",
+    #     save_strategy="no",
+    #     eval_steps=500, # set to higher value to reduce the output in the training cell
+    #     logging_dir=os.path.join(data_path, f"logs/generation_0"),
+    #     logging_steps=1000, # set to higher value to reduce the output in the training cell
+    #     report_to="none" # optionally you can report to tensorboard, wandb etc to get nice visualizations of the training process
+    # )
+
+    # data_collator = DataCollatorForLanguageModeling(
+    #     tokenizer=tokenizer,
+    #     mlm=False
+    # )
+
+    # trainer = Trainer(
+    #     model=model,
+    #     args=training_args,
+    #     train_dataset=split_datasets["train"],
+    #     eval_dataset=split_datasets["test"],
+    #     data_collator=data_collator,
+    # )
+  
+    # trainer.train()
+    # trainer.save_model(model_path)
+
+
+
+    # #Instead of manually decoding tokenized sequences, we will just use the HF's pipeline
+    # generator = pipeline(
+    #     "text-generation",
+    #     model=model,
+    #     tokenizer=tokenizer,
+    #     device=device
+    # )
+    # new_samples = []
+
+    # # We will generate X_1 in batches to manage the GPU memory. We want to generate 40k samples as before.
+    # pbar = tqdm(total=40_000)
+    # while len(new_samples) < 40_000:
+
+    #     outputs = generator(
+    #         tokenizer.bos_token,
+    #         max_new_tokens=100,
+    #         do_sample=True,
+    #         temperature=1.0,
+    #         num_return_sequences=150, # choose the generation batch size which will fit into your GPU memory
+    #         pad_token_id=tokenizer.eos_token_id,
+    #     )
+        
+    #     for output in outputs:
+    #         text = output['generated_text'].replace(tokenizer.bos_token, "").strip()
+    #         if is_valid_tile_sequence(text):
+    #             new_samples.append(text)
+    #             pbar.update(1)
+    #             if len(new_samples) >= 40_000:
+    #                 break
+
+    #     torch.cuda.empty_cache()
+
+    # # In case you collected a few extra samples, trim the list to exactly 40000.
+    # new_samples = new_samples[:40_000]
+
+    # tasks1 = []
+    # for s in new_samples:
+    #     tiles = decode_tile_string(s)
+    #     tasks1.append((count_unique_nodes(tile_list=tiles), tiles))
+
+    # with Pool() as pool:
+    #     X_1_rewards = list(tqdm(pool.imap_unordered(process_reward, tasks1), total=len(tasks1)))
+
+    # X_1 = Dataset.from_dict({'text': new_samples, 'reward': X_1_rewards})
+    X_1_dataset_path = os.path.join(data_path, f"X_1")
+    X_1 = load_from_disk(X_1_dataset_path)     
+    # X_1.save_to_disk(X_1_dataset_path)
+
+    plt.figure(figsize=(8, 4))
+    plt.hist(X_1['reward'], bins=45, edgecolor='black', linewidth=1)
+    plt.title('Rewards Distribution in $X_1$')
+    plt.xlabel('Reward')
+    plt.ylabel('Count')
+    plt.tight_layout()
+    plt.show()
+
+    # Replace with your actual path, same one used in save_to_disk
+    X_1_dataset_path = os.path.join(data_path, "X_1")
+
+    # Load the saved dataset
+
+    # Now you can access the samples
+    sample_1 = decode_tile_string(X_1[1]["text"])
+    print(sample_1)
+    sample_1_edges = tiles_to_edge_list(sample_1)
+    max_node_id = max(max(u, v) for u, v, _ in sample_1_edges)
+    sample_1_adj = lil_matrix((max_node_id + 1, max_node_id + 1), dtype=np.float32)
+    for u, v, w in sample_1_edges:
+        sample_1_adj[u, v] = w
+    sample_1_csr = sample_1_adj.tocsr()
+    sample_1_boundary = find_boundary_edges(0,sample_1_csr,sample_1)
+    print(sample_1_boundary)
+    fig, ax = plt.subplots(figsize=(10, 10))
+    pos = generate_pos_from_edges(sample_1_edges)
+    draw_graph(sample_1_edges,ax,title="Sample one from X_1",boundary_edges=sample_1_boundary,pos=pos)
+    plt.show()
+    print(len(X_1))  # Total number of samples
+
+    # Example: all text samples
+    all_texts = X_1['text']
+
+    # Example: rewards
+    all_rewards = X_1['reward']
+
+
+
+
+
+
+    tokenizer_path = os.path.join(data_path, "tile_tokenizer")
+    tokenizer = PreTrainedTokenizerFast.from_pretrained(tokenizer_path)
+
+    model_path = os.path.join(data_path, "tile_model_0")  # or "model_1", etc.
+    model = GPT2LMHeadModel.from_pretrained(model_path)
+    model.to(device)
+
+    training_args = TrainingArguments(
+        output_dir=os.path.join(data_path, f"generation_1"),  # change this per generation
+        overwrite_output_dir=True,
+        max_steps=15_000,
+        per_device_train_batch_size=32,
+        per_device_eval_batch_size=32,
+        learning_rate=5e-4,
+        lr_scheduler_type="constant",
+        eval_strategy="steps",
+        save_strategy="no",
+        eval_steps=3000,
+        logging_dir=os.path.join(data_path, f"logs/generation_1"),
+        logging_steps=3000,
+        report_to="none"
+    )
+
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+    empty_dataset = Dataset.from_dict({'input_ids': [[0]], 'attention_mask': [[1]]})
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=empty_dataset,  # temporary placeholder
+        eval_dataset=empty_dataset,   # required because eval_strategy is not "no"
+        data_collator=data_collator,
+    )
+
+    all_X_i = {}
+    all_X_i[0] = X_0
+    all_X_i[1] = X_1
+    all_X_i[2] = load_from_disk(os.path.join(data_path, "X_2"))
+    all_X_i[3] = load_from_disk(os.path.join(data_path, "X_3"))
+    sample_X_2 = decode_tile_string(all_X_i[2][1]["text"])
+    print(sample_1)
+    sample_X_3 = decode_tile_string(all_X_i[3][1]["text"])
+    print(sample_1)
+
+
+    # We will do three more generations. We will call the last generation by X_i
+    # for i in range(1, 3):
+    #     print(f"Starting generation {i}...")
+
+    #     # select the top examples
+    #     X_i = all_X_i[i]
+    #     X_i = X_i.sort("reward", reverse=True)
+    #     X_i_top = X_i.select(range(len(X_i) // 4))
+
+    #     # tokenize and do the train/test split
+    #     X_i_top_text = X_i_top.remove_columns(["reward"])
+    #     X_i_top_tokenized = X_i_top_text.map(
+    #         tokenize_function,
+    #         batched=True,
+    #         remove_columns=["text"]
+    #     )
+    #     split_datasets = X_i_top_tokenized.train_test_split(test_size=0.1)
+
+    #     # refresh the output and logging directories in the training arguments
+    #     training_args.output_dir = os.path.join(data_path, f"generation_{i}")
+    #     training_args.logging_dir = os.path.join(data_path, f"logs/generation_{i}")
+
+    #     # reduce evaluation and logging steps even more to avoid excessive output
+    #     training_args.eval_steps = 3000
+    #     training_args.logging_steps = 3000
+
+    #     # put the new arguemtns into the trainer and refresh the train and eval datasets
+    #     trainer.args = training_args
+    #     trainer.train_dataset = split_datasets["train"]
+    #     trainer.eval_dataset = split_datasets["test"]
+
+    #     # run the training
+    #     trainer.train()
+    #     trainer.save_model(os.path.join(data_path, f"model_{i}"))
+
+    #     # generation remains unchanged
+    #     generator = pipeline(
+    #         "text-generation",
+    #         model=model,
+    #         tokenizer=tokenizer,
+    #         device=device
+    #     )
+    #     print("Generating new samples...")
+    #     new_samples = []
+
+    #     pbar = tqdm(total=40_000)
+    #     while len(new_samples) < 40_000:
+    #         outputs = generator(
+    #             tokenizer.bos_token,
+    #             max_new_tokens=100,
+    #             do_sample=True,
+    #             temperature=1.0,
+    #             num_return_sequences=150, # choose the generation batch size which will fit into your GPU memory
+    #             pad_token_id=tokenizer.eos_token_id,
+    #         )
+
+    #         for output in outputs:
+    #             text = output['generated_text'].replace(tokenizer.bos_token, "").strip()
+    #             if is_valid_tile_sequence(text):
+    #                 new_samples.append(text)
+    #                 pbar.update(1)
+    #                 if len(new_samples) >= 40_000:
+    #                     break
+
+    #         torch.cuda.empty_cache()
+
+    #     new_samples = new_samples[:40_000]
+
+    #     tasks1 = []
+    #     for s in new_samples:
+    #         tiles = decode_tile_string(s)
+    #         tasks1.append((count_unique_nodes(tile_list=tiles), tiles))
+
+    #     with Pool() as pool:
+    #         X_i_next_rewards = list(tqdm(pool.imap_unordered(process_reward, tasks1), total=len(tasks1)))
+
+
+
+    #     X_i_next = Dataset.from_dict({'text': new_samples, 'reward': X_i_next_rewards})
+
+    #     X_i_next.save_to_disk(os.path.join(data_path, f"X_{i + 1}"))
+
+    #     all_X_i[i + 1] = X_i_next
+
+    #     print(f"Generation {i} is done.")
+
+    # # Now lets plot our reward distributions for all X_i and compare with Figure 4 in the paper
+
+    fig = plt.figure(figsize=(15, 10))
+
+    gs_top = gridspec.GridSpec(1, 3, top=0.95, bottom=0.55, wspace=0.3)
+    ax1 = fig.add_subplot(gs_top[0])
+    ax2 = fig.add_subplot(gs_top[1])
+    ax3 = fig.add_subplot(gs_top[2])
+
+
+    gs_bottom = gridspec.GridSpec(1, 7, top=0.45, bottom=0.05,
+                                width_ratios=[1, 2, 2, 1, 2, 2, 1], wspace=0.3)
+    ax4 = fig.add_subplot(gs_bottom[1:3])
+    ax5 = fig.add_subplot(gs_bottom[4:6])
+
+    # Plot histograms for X_0 through X_4
+    ax1.hist(all_X_i[0]['reward'], bins=45, edgecolor='black', linewidth=1)
+    ax1.set_title('Rewards Distribution in $X_0$')
+    ax1.set_xlabel('Reward')
+    ax1.set_ylabel('Count')
+
+    ax2.hist(all_X_i[1]['reward'], bins=45, edgecolor='black', linewidth=1)
+    ax2.set_title('Rewards Distribution in $X_1$')
+    ax2.set_xlabel('Reward')
+    ax2.set_ylabel('Count')
+
+    ax3.hist(all_X_i[2]['reward'], bins=45, edgecolor='black', linewidth=1)
+    ax3.set_title('Rewards Distribution in $X_2$')
+    ax3.set_xlabel('Reward')
+    ax3.set_ylabel('Count')
+
+    ax4.hist(all_X_i[3]['reward'], bins=45, edgecolor='black', linewidth=1)
+    ax4.set_title('Rewards Distribution in $X_3$')
+    ax4.set_xlabel('Reward')
+    ax4.set_ylabel('Count')
+
+    plt.show()
+
+
